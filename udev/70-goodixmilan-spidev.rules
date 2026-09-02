@@ -1,0 +1,3 @@
+# GXFP3200 (Goodix Milan): bind spidev to the fingerprint sensor at boot.
+# Install into /etc/udev/rules.d/ (takes priority, not overwritten by distro libfprint updates).
+ACTION=="add|change", SUBSYSTEM=="spi", ENV{MODALIAS}=="acpi:GXFP3200:", RUN{builtin}+="kmod load spi:spidev", RUN+="/bin/sh -c 'echo spidev > %S%p/driver_override && echo %k > %S%p/subsystem/drivers/spidev/bind'"
