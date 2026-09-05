@@ -31,7 +31,7 @@ sensors (GXFP32xx, GDIX…) use a similar protocol, so this driver can serve as 
 ## Installation (Debian/Ubuntu)
 
 ```sh
-git clone https://github.com/<you>/goodix-gxfp3200-linux.git
+git clone https://github.com/bchapoton/goodix-gxfp3200-linux.git
 cd goodix-gxfp3200-linux
 ./install.sh
 ```
