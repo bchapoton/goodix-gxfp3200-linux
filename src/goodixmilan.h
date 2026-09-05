@@ -25,5 +25,8 @@
 #define GXMILAN_FRAMELEN   14260
 #define GXMILAN_FB_REG     0xAAAA
 
-/* Reset GPIO: line 271 of the INT34BB gpiochip, from the ACPI _CRS of FPRT. */
+/* Reset GPIO: line 271 of the INT34BB gpiochip, from the ACPI _CRS of FPRT.
+ * The /dev/gpiochipN number is not stable across boots or machines, so the
+ * driver looks the controller up by label rather than by number. */
 #define GXMILAN_RESET_LINE 271
+#define GXMILAN_GPIO_LABEL "INT34BB"

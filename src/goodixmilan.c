@@ -139,8 +139,44 @@ gxm_cfg (FpiDeviceGoodixMilan *self, const GxReg *regs, gsize count)
   return TRUE;
 }
 
-/* Hardware reset: a short pulse on GPIO line 271 (ACPI _CRS). */
-static void
+/* Opens the gpiochip that carries the reset line. The /dev/gpiochipN number is
+ * not stable across boots or machines, so match on the controller label and
+ * only fall back to gpiochip0. */
+static int
+gx_open_gpiochip (void)
+{
+  int n;
+
+  for (n = 0; n < 16; n++)
+    {
+      struct gpiochip_info info = { 0 };
+      g_autofree gchar *path = g_strdup_printf ("/dev/gpiochip%d", n);
+      int fd = open (path, O_RDWR | O_CLOEXEC);
+
+      if (fd < 0)
+        continue;
+      if (ioctl (fd, GPIO_GET_CHIPINFO_IOCTL, &info) == 0 &&
+          g_str_has_prefix (info.label, GXMILAN_GPIO_LABEL) &&
+          info.lines > GXMILAN_RESET_LINE)
+        {
+          fp_dbg ("reset gpiochip: %s (label %s, %u lines)",
+                  path, info.label, info.lines);
+          return fd;
+        }
+      close (fd);
+    }
+  return open ("/dev/gpiochip0", O_RDWR | O_CLOEXEC);
+}
+
+/* Hardware reset: a short pulse on GPIO line 271 (ACPI _CRS).
+ *
+ * Returns FALSE if the pulse could not be issued. That is not cosmetic: without
+ * a hardware reset the sensor cannot be brought back once it has lost its
+ * configuration (typically across a suspend/resume cycle), and every capture
+ * then times out until the next reboot. The usual cause is fprintd.service's
+ * DeviceAllow= sandbox, which denies /dev/gpiochip* — see the drop-in shipped
+ * in systemd/10-goodixmilan-gpio.conf. */
+static gboolean
 gx_gpio_reset (FpiDeviceGoodixMilan *self)
 {
   struct gpio_v2_line_request req = { 0 };
@@ -148,17 +184,26 @@ gx_gpio_reset (FpiDeviceGoodixMilan *self)
   int chip;
 
   (void) self;
-  chip = open ("/dev/gpiochip0", O_RDWR | O_CLOEXEC);
+  chip = gx_open_gpiochip ();
   if (chip < 0)
-    return;
+    {
+      fp_warn ("cannot open a gpiochip for the reset line: %s. Under fprintd "
+               "this means the DeviceAllow= sandbox is denying /dev/gpiochip*; "
+               "install systemd/10-goodixmilan-gpio.conf. Without a reset the "
+               "sensor cannot recover after a suspend/resume cycle.",
+               g_strerror (errno));
+      return FALSE;
+    }
   req.num_lines = 1;
   req.offsets[0] = GXMILAN_RESET_LINE;
   req.config.flags = GPIO_V2_LINE_FLAG_OUTPUT;
   g_strlcpy (req.consumer, "goodixmilan", sizeof req.consumer);
   if (ioctl (chip, GPIO_V2_GET_LINE_IOCTL, &req) < 0 || req.fd < 0)
     {
+      fp_warn ("cannot claim reset GPIO line %d: %s", GXMILAN_RESET_LINE,
+               g_strerror (errno));
       close (chip);
-      return;
+      return FALSE;
     }
   val.mask = 1;
   val.bits = 0;                          /* assert reset */
@@ -169,6 +214,7 @@ gx_gpio_reset (FpiDeviceGoodixMilan *self)
   g_usleep (120000);
   close (req.fd);
   close (chip);
+  return TRUE;
 }
 
 /* Six bytes carry four interleaved 12-bit pixels (Goodix packing). */
@@ -193,7 +239,8 @@ gx_sensor_init (FpiDeviceGoodixMilan *self)
 {
   guint8 id[4];
 
-  gx_gpio_reset (self);
+  if (!gx_gpio_reset (self))
+    return FALSE;
   if (!gxm_write_reg (self, 0x0124, 0x0D00))
     return FALSE;
   if (!gxm_write_reg (self, 0x0204, 0x0000))
@@ -284,7 +331,28 @@ gx_finger_present (FpiDeviceGoodixMilan *self)
       double d = ((double) self->bg_frame[i] - px[i]) - m;
       v += d * d;
     }
-  return sqrt (v / GOODIX_IMG_PIXELS) > GX_DETECT_STD;
+  {
+    static int tick = 0;
+    double std = sqrt (v / GOODIX_IMG_PIXELS);
+
+    /* One line every ~1 s: the delta statistics that drive detection, plus the
+     * raw frame range, so a dead or saturated sensor is told apart from a
+     * mis-tuned threshold. */
+    if ((tick++ % 10) == 0)
+      {
+        guint16 lo = 0xffff, hi = 0, blo = 0xffff, bhi = 0;
+
+        for (i = 0; i < GOODIX_IMG_PIXELS; i++)
+          {
+            lo = MIN (lo, px[i]); hi = MAX (hi, px[i]);
+            blo = MIN (blo, self->bg_frame[i]); bhi = MAX (bhi, self->bg_frame[i]);
+          }
+        fp_dbg ("detect: std=%.1f (threshold %.1f) mean_delta=%.1f "
+                 "frame=[%u..%u] bg=[%u..%u]",
+                 std, (double) GX_DETECT_STD, m, lo, hi, blo, bhi);
+      }
+    return std > GX_DETECT_STD;
+  }
 }
 
 /* Init the sensor and take a fresh background (finger assumed lifted). */
@@ -438,6 +506,11 @@ gx_views_from_print (FpPrint *print)
 #define GX_ADAPT_MIN      30
 #define GX_ADAPT_MAX_FRAC 0.60
 #define GX_ADAPT_VIEWS    20
+/* Adaptive views actually consulted (the most recent ones). The score is a
+ * monotone union of matched-point bits, so every extra view can only raise it,
+ * never lower it: consulting the whole store would let the false-accept rate
+ * drift upwards with use. Bound, not calibrated — worth measuring on real data. */
+#define GX_ADAPT_USE      8
 #define GX_ADAPT_DIR      "/var/lib/fprint/.goodixmilan-adapt"
 
 static gchar *
@@ -565,7 +638,11 @@ gx_adapt_sweep (void)
 /* ------------------------------------------------------------------ */
 
 #define GX_MATCH_THRESHOLD 15
-#define GX_ENROLL_STAGES   6
+/* Passes asked of the user at enrolment, reported to fprintd/GNOME through
+ * nr_enroll_stages. The sensor images only ~10x8 mm, so a single pass covers a
+ * small part of the fingertip; eight passes (x GX_VIEWS_PER_STAGE views each)
+ * are needed to cover the edges well enough to keep false rejects low. */
+#define GX_ENROLL_STAGES   8
 #define GX_VIEWS_PER_STAGE 2
 
 typedef struct
@@ -750,11 +827,13 @@ gx_poll_off (gpointer user_data)
   if (!gx_finger_present (self) || ++t->polls > GX_POLL_OFF)
     {
       fpi_device_report_finger_status (dev, FP_FINGER_STATUS_NONE);
+      /* Clear before jumping: the jump can rearm a timeout, and assigning 0
+       * afterwards would drop the fresh handle on the floor. */
+      self->poll_id = 0;
       if (t->verifying || t->stage >= GX_ENROLL_STAGES)
         fpi_ssm_jump_to_state (ssm, GX_ST_DONE);
       else
         fpi_ssm_jump_to_state (ssm, GX_ST_WAIT_ON);
-      self->poll_id = 0;
       return G_SOURCE_REMOVE;
     }
   return G_SOURCE_CONTINUE;
@@ -810,7 +889,8 @@ gx_capture_done (GObject *src, GAsyncResult *res, gpointer user_data)
 
         for (i = 0; i < views->len; i++)
           gx_sift_match_mask (g_ptr_array_index (views, i), f, seen);
-        for (i = 0; i < extra->len; i++)
+        for (i = extra->len > GX_ADAPT_USE ? extra->len - GX_ADAPT_USE : 0;
+             i < extra->len; i++)
           gx_sift_match_mask (g_ptr_array_index (extra, i), f, seen);
         for (i = 0; i < f->n; i++)
           fused += seen[i];
@@ -906,9 +986,19 @@ gx_verify_done (FpiSsm *ssm, FpDevice *dev, GError *error)
 
   if (error)
     {
+      /* A retry is reported on the verify itself and the operation then
+       * completes cleanly; any other error aborts the operation. Note that
+       * reporting transfers the error, so it must not be passed on again. */
       if (error->domain == FP_DEVICE_RETRY)
-        fpi_device_verify_report (dev, FPI_MATCH_ERROR, NULL, g_steal_pointer (&error));
-      fpi_device_verify_complete (dev, error);
+        {
+          fpi_device_verify_report (dev, FPI_MATCH_ERROR, NULL,
+                                    g_steal_pointer (&error));
+          fpi_device_verify_complete (dev, NULL);
+        }
+      else
+        {
+          fpi_device_verify_complete (dev, g_steal_pointer (&error));
+        }
       return;
     }
   if (!t->probe)
@@ -925,8 +1015,10 @@ gx_verify_done (FpiSsm *ssm, FpDevice *dev, GError *error)
     g_autofree gchar *apath = gx_adapt_path (template);
     g_autoptr(GPtrArray) extra = gx_adapt_load (apath);
 
-    fp_info ("verify: %d matches (threshold %d, %u views + %u acquired)",
-             best, GX_MATCH_THRESHOLD, views->len, extra->len);
+    fp_info ("verify: %d matches (threshold %d, %u views + %u acquired, "
+             "probe had %d keypoints)",
+             best, GX_MATCH_THRESHOLD, views->len, extra->len,
+             t->probe ? t->probe->n : -1);
     if (best >= GX_ADAPT_MIN &&
         best <= (int) (GX_ADAPT_MAX_FRAC * t->probe->n) &&
         extra->len < GX_ADAPT_VIEWS)
@@ -980,7 +1072,17 @@ gx_dev_open (FpDevice *dev)
     ioctl (self->spi_fd, SPI_IOC_WR_BITS_PER_WORD, &bits);
     ioctl (self->spi_fd, SPI_IOC_WR_MAX_SPEED_HZ, &speed);
   }
-  gx_gpio_reset (self);
+  if (!gx_gpio_reset (self))
+    {
+      close (self->spi_fd);
+      self->spi_fd = -1;
+      fpi_device_open_complete (dev, fpi_device_error_new_msg (
+        FP_DEVICE_ERROR_GENERAL,
+        "cannot pulse the reset GPIO (%s). Install the systemd drop-in "
+        "systemd/10-goodixmilan-gpio.conf: fprintd's DeviceAllow= sandbox "
+        "denies /dev/gpiochip* by default.", g_strerror (errno)));
+      return;
+    }
   fpi_device_open_complete (dev, NULL);
 }
 
@@ -1045,6 +1147,7 @@ fpi_device_goodixmilan_finalize (GObject *object)
 {
   FpiDeviceGoodixMilan *self = FPI_DEVICE_GOODIXMILAN (object);
 
+  g_clear_handle_id (&self->poll_id, g_source_remove);
   if (self->spi_fd >= 0)
     close (self->spi_fd);
   g_clear_pointer (&self->bg_frame, g_free);
