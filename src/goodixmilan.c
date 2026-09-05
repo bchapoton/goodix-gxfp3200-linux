@@ -682,6 +682,12 @@ enum {
   GX_ST_NUM,
 };
 
+/* Captures a verification may take from a single press. Only one was taken, so
+ * a press that happened to be photographed while the finger was still sliding
+ * failed outright, even though the finger was still down and a second shot
+ * would have succeeded. The score kept is the best of the attempts. */
+#define GX_VERIFY_TRIES 3
+
 #define GX_POLL_MS   100
 #define GX_POLL_MAX  120
 #define GX_POLL_OFF  100
@@ -957,6 +963,15 @@ gx_capture_done (GObject *src, GAsyncResult *res, gpointer user_data)
                placed ? "" : " (disjoint)");
       fpi_device_enroll_progress (dev, t->stage, NULL, NULL);
     }
+  /* Short of the threshold, but the finger is still down: take another shot
+   * instead of failing on one noisy capture. */
+  if (t->verifying && t->best < GX_MATCH_THRESHOLD &&
+      t->tries < GX_VERIFY_TRIES && gx_finger_present (self))
+    {
+      fpi_ssm_jump_to_state (ssm, GX_ST_CAPTURE);
+      return;
+    }
+
   fpi_device_report_finger_status (dev, FP_FINGER_STATUS_PRESENT);
   t->polls = 0;
   self->poll_id = g_timeout_add (GX_POLL_MS, gx_poll_off, ssm);
