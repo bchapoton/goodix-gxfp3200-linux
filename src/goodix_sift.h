@@ -92,6 +92,13 @@ int gx_sift_match_mask (const GxSiftFeatures *a, const GxSiftFeatures *b,
 int gx_sift_match_xform (const GxSiftFeatures *a, const GxSiftFeatures *b,
                          guint8 *mask, int *out_tx, int *out_ty);
 
+/* Descriptor pairs that survived the ratio test in the last match, before the
+ * geometric vote. Comparing it with the returned score says which of the two
+ * stages is discarding the evidence: a large pair count with a small score
+ * means the geometry is rejecting good pairs, not that the descriptors failed
+ * to match. Diagnostic only, and not thread-safe. */
+int gx_sift_last_pairs (void);
+
 /*
  * Incremental registration, used to guide enrolment in real time.
  *

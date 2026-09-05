@@ -112,7 +112,7 @@ echo "(verify exit code $RC)"
 # --------------------------------------------------------- 5. measurements
 head1 "4. What the driver measured"
 sudo journalctl -u fprintd --no-pager --since "-5 min" -o cat 2>/dev/null \
-  | grep -E "chip-id|session ready|detect:|enroll:|verify:|cannot (open|claim|pulse)" \
+  | grep -E "chip-id|session ready|detect:|enroll:|verify:|repeatability:|cannot (open|claim|pulse)" \
   | tail -40
 
 cat <<'MSG'
@@ -125,4 +125,12 @@ cat <<'MSG'
                   N is how many keypoints of the probe were matched by the
                   stored views. 0 with a good image means the template no longer
                   describes what the sensor produces: re-enrol (--enroll).
+    repeatability the score between two captures of the SAME press, taken
+                  milliseconds apart with the finger still. This is the ceiling
+                  of the whole pipeline: if it is low, the images themselves are
+                  not repeatable and no amount of enrolment coverage will help.
+    pairs / descriptor pairs
+                  candidate matches before the geometric check. Compare with the
+                  score that follows: a large gap means geometry is discarding
+                  them, a small pairs count means the descriptors never matched.
 MSG

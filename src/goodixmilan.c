@@ -32,6 +32,14 @@
 
 /* Frames averaged for the background reference. */
 #define GOODIX_BG_FRAMES   3
+/* Frames averaged for the finger image itself. The background was already
+ * averaged while the live image was a single frame, so all the sensor noise
+ * landed on the one image keypoints are extracted from. Measured on this
+ * sensor, two captures of the same motionless press shared only about 37% of
+ * their keypoints (score 14..45, mean 30 out of ~82), which put the matching
+ * ceiling barely above the decision threshold. Averaging cuts that noise by
+ * sqrt(n) at the cost of ~50 ms per extra frame. */
+#define GOODIX_CAP_FRAMES  3
 /* Contrast (std of the preprocessed image) below which a capture has no finger.
  * The keypoint detector returns maxima even on noise, so contrast — not point
  * count — is what separates a real press (~150+) from an empty frame (~5). */
@@ -436,7 +444,7 @@ gx_capture_features (FpiDeviceGoodixMilan *self)
   double m = 0, v = 0;
   int i;
 
-  if (!gx_capture_frame (self, px))
+  if (!gx_capture_avg (self, GOODIX_CAP_FRAMES, px))
     return NULL;
   gx_dump_capture (self, px);
   img = gx_preprocess (self, px);
@@ -503,7 +511,13 @@ gx_views_from_print (FpPrint *print)
 /*  Adaptive store: widens coverage as the sensor is used              */
 /* ------------------------------------------------------------------ */
 
-#define GX_ADAPT_MIN      30
+/* Lower bound of the adaptive-learning window. It must sit just above
+ * GX_MATCH_THRESHOLD, not far above it: a confident match has to be reachable,
+ * or the store never fills and the driver never improves with use. Measured on
+ * this sensor, a genuine finger scores roughly 3..25 against a fresh template,
+ * so the previous value of 30 was above anything the pipeline can produce and
+ * the window [30, 0.60*n] was never entered even once. */
+#define GX_ADAPT_MIN      (GX_MATCH_THRESHOLD + 3)
 #define GX_ADAPT_MAX_FRAC 0.60
 #define GX_ADAPT_VIEWS    20
 /* Adaptive views actually consulted (the most recent ones). The score is a
@@ -650,6 +664,8 @@ typedef struct
   GPtrArray     *views;
   GxSiftFeatures *probe;
   int            best;
+  int            pairs_max;    /* descriptor pairs the best view offered the
+                                * geometric vote — diagnostic */
   int            tries;
   int            stage;
   int            polls;
@@ -851,7 +867,22 @@ gx_capture_done (GObject *src, GAsyncResult *res, gpointer user_data)
 
   (void) src; (void) user_data;
   for (guint e = 0; w->extra && e < w->extra->len; e++)
-    g_ptr_array_add (t->views, g_ptr_array_index (w->extra, e));
+    {
+      GxSiftFeatures *g = g_ptr_array_index (w->extra, e);
+
+      /* Same press, same background, milliseconds apart and the finger did not
+       * move: the score between these two views is the ceiling this pipeline
+       * can reach. If it is low, no amount of enrolment coverage will help. */
+      if (f)
+        {
+          int sc = gx_sift_match (f, g);
+
+          fp_info ("repeatability: same-press views score %d "
+                   "(%u vs %u keypoints, %d descriptor pairs)",
+                   sc, f->n, g->n, gx_sift_last_pairs ());
+        }
+      g_ptr_array_add (t->views, g);
+    }
   if (w->extra)
     g_ptr_array_set_free_func (w->extra, NULL);
 
@@ -888,10 +919,16 @@ gx_capture_done (GObject *src, GAsyncResult *res, gpointer user_data)
         int fused = 0;
 
         for (i = 0; i < views->len; i++)
-          gx_sift_match_mask (g_ptr_array_index (views, i), f, seen);
+          {
+            gx_sift_match_mask (g_ptr_array_index (views, i), f, seen);
+            t->pairs_max = MAX (t->pairs_max, gx_sift_last_pairs ());
+          }
         for (i = extra->len > GX_ADAPT_USE ? extra->len - GX_ADAPT_USE : 0;
              i < extra->len; i++)
-          gx_sift_match_mask (g_ptr_array_index (extra, i), f, seen);
+          {
+            gx_sift_match_mask (g_ptr_array_index (extra, i), f, seen);
+            t->pairs_max = MAX (t->pairs_max, gx_sift_last_pairs ());
+          }
         for (i = 0; i < f->n; i++)
           fused += seen[i];
         if (fused > t->best)
@@ -915,8 +952,9 @@ gx_capture_done (GObject *src, GAsyncResult *res, gpointer user_data)
         t->island = gx_sift_island_new ();
       placed = gx_sift_island_add (t->island, f, &dx, &dy, &sc);
       gx_sift_island_extent (t->island, &x0, &y0, &x1, &y1, &np);
-      fp_info ("enroll: stage=%d overlap=%d extent=%dx%d points=%u%s",
-               t->stage, sc, x1 - x0, y1 - y0, np, placed ? "" : " (disjoint)");
+      fp_info ("enroll: stage=%d overlap=%d pairs=%d extent=%dx%d points=%u%s",
+               t->stage, sc, gx_sift_last_pairs (), x1 - x0, y1 - y0, np,
+               placed ? "" : " (disjoint)");
       fpi_device_enroll_progress (dev, t->stage, NULL, NULL);
     }
   fpi_device_report_finger_status (dev, FP_FINGER_STATUS_PRESENT);
@@ -1016,9 +1054,9 @@ gx_verify_done (FpiSsm *ssm, FpDevice *dev, GError *error)
     g_autoptr(GPtrArray) extra = gx_adapt_load (apath);
 
     fp_info ("verify: %d matches (threshold %d, %u views + %u acquired, "
-             "probe had %d keypoints)",
+             "probe had %d keypoints, best view offered %d descriptor pairs)",
              best, GX_MATCH_THRESHOLD, views->len, extra->len,
-             t->probe ? t->probe->n : -1);
+             t->probe ? t->probe->n : -1, t->pairs_max);
     if (best >= GX_ADAPT_MIN &&
         best <= (int) (GX_ADAPT_MAX_FRAC * t->probe->n) &&
         extra->len < GX_ADAPT_VIEWS)

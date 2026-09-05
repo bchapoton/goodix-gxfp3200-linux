@@ -254,6 +254,14 @@ desc_dist2 (const guint8 *a, const guint8 *b)
   return s;
 }
 
+static int gx_sift_pairs_last;
+
+int
+gx_sift_last_pairs (void)
+{
+  return gx_sift_pairs_last;
+}
+
 int
 gx_sift_match_xform (const GxSiftFeatures *A, const GxSiftFeatures *B,
                      guint8 *mask, int *out_tx, int *out_ty)
@@ -287,7 +295,10 @@ gx_sift_match_xform (const GxSiftFeatures *A, const GxSiftFeatures *B,
         { pi[np] = i; pj[np] = jb; np++; }
     }
   if (np < MIN_PAIRS)
-    return 0;
+    {
+      gx_sift_pairs_last = np;
+      return 0;
+    }
 
   /* Geometric validation: vote on the implied translation. Widening GEO_TOL
    * beyond 6 px was tried and rejected — it lifts impostor scores as much as
@@ -309,6 +320,7 @@ gx_sift_match_xform (const GxSiftFeatures *A, const GxSiftFeatures *B,
         { best = cnt; bt_x = tx; bt_y = ty; }
     }
 
+  gx_sift_pairs_last = np;
   if (out_tx) *out_tx = (int) bt_x;
   if (out_ty) *out_ty = (int) bt_y;
 
